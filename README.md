@@ -1,13 +1,11 @@
 # ACT: Action Chunking with Transformers
 
-### *New*: [ACT tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing)
-TL;DR: if your ACT policy is jerky or pauses in the middle of an episode, just train for longer! Success rate and smoothness can improve way after loss plateaus.
+## Fork-Specific Information (zebehn/act)
+This fork adds Apple Silicon support and experiment documentation on top of the original ACT repository.
 
-#### Project Website: https://tonyzhaozh.github.io/aloha/
-
-This repo contains the implementation of ACT, together with 2 simulated environments:
-Transfer Cube and Bimanual Insertion. You can train and evaluate ACT in sim or real.
-For real, you would also need to install [ALOHA](https://github.com/tonyzhaozh/aloha).
+- Device support: `--device auto|mps|cuda|cpu` (`auto` prefers MPS on macOS).
+- Resume support: `--resume_ckpt auto` to continue from latest valid checkpoint.
+- Full macOS setup + run guide: [docs/MACOS_APPLE_SILICON_GUIDE.md](docs/MACOS_APPLE_SILICON_GUIDE.md)
 
 ### Quickstart (Apple Silicon)
 ```bash
@@ -38,11 +36,19 @@ python imitate_episodes.py --eval --task_name sim_transfer_cube_scripted --ckpt_
   --num_epochs 2000 --lr 1e-5 --seed 0 --device mps
 ```
 
+---
+## Original README (ACT)
+### *New*: [ACT tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing)
+TL;DR: if your ACT policy is jerky or pauses in the middle of an episode, just train for longer! Success rate and smoothness can improve way after loss plateaus.
+
+#### Project Website: https://tonyzhaozh.github.io/aloha/
+
+This repo contains the implementation of ACT, together with 2 simulated environments:
+Transfer Cube and Bimanual Insertion. You can train and evaluate ACT in sim or real.
+For real, you would also need to install [ALOHA](https://github.com/tonyzhaozh/aloha).
+
 ### Updates:
 You can find all scripted/human demo for simulated environments [here](https://drive.google.com/drive/folders/1gPR03v05S1xiInoVJn7G7VJ9pDCnxq9O?usp=share_link).
-
-### Documentation
-- [macOS Apple Silicon (MPS) Installation, Data, Train, and Eval Guide](docs/MACOS_APPLE_SILICON_GUIDE.md)
 
 
 ### Repo Structure
