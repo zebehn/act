@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from .models import build_ACT_model, build_CNNMLP_model
+from device_utils import resolve_device
 
 import IPython
 e = IPython.embed
@@ -63,6 +64,8 @@ def get_args_parser():
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
     parser.add_argument('--chunk_size', action='store', type=int, help='chunk_size', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    parser.add_argument('--device', default='auto', choices=['auto', 'mps', 'cuda', 'cpu'])
+    parser.add_argument('--resume_ckpt', action='store', type=str, required=False)
 
     return parser
 
@@ -75,7 +78,8 @@ def build_ACT_model_and_optimizer(args_override):
         setattr(args, k, v)
 
     model = build_ACT_model(args)
-    model.cuda()
+    device = resolve_device(args.device)
+    model.to(device)
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
@@ -98,7 +102,8 @@ def build_CNNMLP_model_and_optimizer(args_override):
         setattr(args, k, v)
 
     model = build_CNNMLP_model(args)
-    model.cuda()
+    device = resolve_device(args.device)
+    model.to(device)
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
@@ -111,4 +116,3 @@ def build_CNNMLP_model_and_optimizer(args_override):
                                   weight_decay=args.weight_decay)
 
     return model, optimizer
-

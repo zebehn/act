@@ -3,6 +3,8 @@ import numpy as np
 import os
 import pickle
 import argparse
+import glob
+import re
 import matplotlib.pyplot as plt
 from copy import deepcopy
 from tqdm import tqdm
@@ -15,14 +17,59 @@ from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
-
-from sim_env import BOX_POSE
+from device_utils import resolve_device
 
 import IPython
 e = IPython.embed
 
+
+def count_available_episodes(dataset_dir):
+    pattern = os.path.join(dataset_dir, 'episode_*.hdf5')
+    episode_ids = []
+    for path in glob.glob(pattern):
+        match = re.search(r'episode_(\d+)\.hdf5$', os.path.basename(path))
+        if match:
+            episode_ids.append(int(match.group(1)))
+    if not episode_ids:
+        return 0
+    episode_ids = sorted(set(episode_ids))
+    contiguous = 0
+    for idx in episode_ids:
+        if idx != contiguous:
+            break
+        contiguous += 1
+    return contiguous
+
+
+def resolve_resume_checkpoint(resume_ckpt, ckpt_dir, device):
+    if not resume_ckpt:
+        return None
+
+    candidate = None
+    if resume_ckpt == 'auto':
+        epoch_ckpts = glob.glob(os.path.join(ckpt_dir, 'policy_epoch_*_seed_*.ckpt'))
+        epoch_ckpts = sorted(epoch_ckpts, key=lambda p: int(re.search(r'policy_epoch_(\d+)_seed_', os.path.basename(p)).group(1)) if re.search(r'policy_epoch_(\d+)_seed_', os.path.basename(p)) else -1, reverse=True)
+        candidates = epoch_ckpts + [os.path.join(ckpt_dir, 'policy_best.ckpt'), os.path.join(ckpt_dir, 'policy_last.ckpt')]
+    else:
+        candidates = [resume_ckpt]
+
+    for path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            torch.load(path, map_location=device)
+            candidate = path
+            break
+        except Exception as e:
+            print(f'Skipping invalid checkpoint {path}: {e}')
+
+    return candidate
+
+
 def main(args):
     set_seed(1)
+    device = resolve_device(args.get('device', 'auto'))
+    print(f'Using device: {device}')
     # command line parameters
     is_eval = args['eval']
     ckpt_dir = args['ckpt_dir']
@@ -45,6 +92,12 @@ def main(args):
     num_episodes = task_config['num_episodes']
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
+    available_episodes = count_available_episodes(dataset_dir)
+    if available_episodes == 0:
+        raise FileNotFoundError(f'No episode_*.hdf5 files found in dataset directory: {dataset_dir}')
+    if available_episodes < num_episodes:
+        print(f'Found {available_episodes} local episodes in {dataset_dir}; overriding requested num_episodes={num_episodes}.')
+        num_episodes = available_episodes
 
     # fixed parameters
     state_dim = 14
@@ -85,7 +138,9 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        'device': device,
+        'resume_ckpt': args.get('resume_ckpt'),
     }
 
     if is_eval:
@@ -100,7 +155,9 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
+    train_dataloader, val_dataloader, stats, _ = load_data(
+        dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, device=device
+    )
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -138,13 +195,13 @@ def make_optimizer(policy_class, policy):
     return optimizer
 
 
-def get_image(ts, camera_names):
+def get_image(ts, camera_names, device):
     curr_images = []
     for cam_name in camera_names:
         curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
         curr_images.append(curr_image)
     curr_image = np.stack(curr_images, axis=0)
-    curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
+    curr_image = torch.from_numpy(curr_image / 255.0).float().to(device).unsqueeze(0)
     return curr_image
 
 
@@ -160,14 +217,15 @@ def eval_bc(config, ckpt_name, save_episode=True):
     max_timesteps = config['episode_len']
     task_name = config['task_name']
     temporal_agg = config['temporal_agg']
+    device = config['device']
     onscreen_cam = 'angle'
 
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
-    loading_status = policy.load_state_dict(torch.load(ckpt_path))
+    loading_status = policy.load_state_dict(torch.load(ckpt_path, map_location=device))
     print(loading_status)
-    policy.cuda()
+    policy.to(device)
     policy.eval()
     print(f'Loaded: {ckpt_path}')
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
@@ -198,13 +256,16 @@ def eval_bc(config, ckpt_name, save_episode=True):
     num_rollouts = 50
     episode_returns = []
     highest_rewards = []
+    box_pose_ref = None
+    if 'sim_transfer_cube' in task_name or 'sim_insertion' in task_name:
+        from sim_env import BOX_POSE as box_pose_ref
     for rollout_id in range(num_rollouts):
         rollout_id += 0
         ### set task
         if 'sim_transfer_cube' in task_name:
-            BOX_POSE[0] = sample_box_pose() # used in sim reset
+            box_pose_ref[0] = sample_box_pose() # used in sim reset
         elif 'sim_insertion' in task_name:
-            BOX_POSE[0] = np.concatenate(sample_insertion_pose()) # used in sim reset
+            box_pose_ref[0] = np.concatenate(sample_insertion_pose()) # used in sim reset
 
         ts = env.reset()
 
@@ -216,9 +277,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
         ### evaluation loop
         if temporal_agg:
-            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
+            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim], device=device)
 
-        qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
+        qpos_history = torch.zeros((1, max_timesteps, state_dim), device=device)
         image_list = [] # for visualization
         qpos_list = []
         target_qpos_list = []
@@ -239,9 +300,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     image_list.append({'main': obs['image']})
                 qpos_numpy = np.array(obs['qpos'])
                 qpos = pre_process(qpos_numpy)
-                qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
+                qpos = torch.from_numpy(qpos).float().to(device).unsqueeze(0)
                 qpos_history[:, t] = qpos
-                curr_image = get_image(ts, camera_names)
+                curr_image = get_image(ts, camera_names, device)
 
                 ### query policy
                 if config['policy_class'] == "ACT":
@@ -255,7 +316,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         k = 0.01
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
                         exp_weights = exp_weights / exp_weights.sum()
-                        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+                        exp_weights = torch.from_numpy(exp_weights).to(device).unsqueeze(dim=1)
                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
                     else:
                         raw_action = all_actions[:, t % query_frequency]
@@ -313,9 +374,12 @@ def eval_bc(config, ckpt_name, save_episode=True):
     return success_rate, avg_return
 
 
-def forward_pass(data, policy):
+def forward_pass(data, policy, device):
     image_data, qpos_data, action_data, is_pad = data
-    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+    image_data = image_data.to(device, non_blocking=True)
+    qpos_data = qpos_data.to(device, non_blocking=True)
+    action_data = action_data.to(device, non_blocking=True)
+    is_pad = is_pad.to(device, non_blocking=True)
     return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
 
 
@@ -325,25 +389,36 @@ def train_bc(train_dataloader, val_dataloader, config):
     seed = config['seed']
     policy_class = config['policy_class']
     policy_config = config['policy_config']
+    device = config['device']
+    resume_ckpt = config.get('resume_ckpt')
 
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
-    policy.cuda()
+    policy.to(device)
     optimizer = make_optimizer(policy_class, policy)
+
+    start_epoch = 0
+    resume_path = resolve_resume_checkpoint(resume_ckpt, ckpt_dir, device)
+    if resume_path is not None:
+        policy.load_state_dict(torch.load(resume_path, map_location=device))
+        match = re.search(r'policy_epoch_(\d+)_seed_', os.path.basename(resume_path))
+        if match:
+            start_epoch = int(match.group(1)) + 1
+        print(f'Resumed model weights from {resume_path}, start_epoch={start_epoch}')
 
     train_history = []
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
-    for epoch in tqdm(range(num_epochs)):
+    for epoch in tqdm(range(start_epoch, num_epochs)):
         print(f'\nEpoch {epoch}')
         # validation
         with torch.inference_mode():
             policy.eval()
             epoch_dicts = []
             for batch_idx, data in enumerate(val_dataloader):
-                forward_dict = forward_pass(data, policy)
+                forward_dict = forward_pass(data, policy, device)
                 epoch_dicts.append(forward_dict)
             epoch_summary = compute_dict_mean(epoch_dicts)
             validation_history.append(epoch_summary)
@@ -361,15 +436,16 @@ def train_bc(train_dataloader, val_dataloader, config):
         # training
         policy.train()
         optimizer.zero_grad()
+        epoch_start_idx = len(train_history)
         for batch_idx, data in enumerate(train_dataloader):
-            forward_dict = forward_pass(data, policy)
+            forward_dict = forward_pass(data, policy, device)
             # backward
             loss = forward_dict['loss']
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
             train_history.append(detach_dict(forward_dict))
-        epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
+        epoch_summary = compute_dict_mean(train_history[epoch_start_idx:])
         epoch_train_loss = epoch_summary['loss']
         print(f'Train loss: {epoch_train_loss:.5f}')
         summary_string = ''
@@ -431,5 +507,7 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    parser.add_argument('--device', action='store', type=str, default='auto', choices=['auto', 'mps', 'cuda', 'cpu'])
+    parser.add_argument('--resume_ckpt', action='store', type=str, default=None, help='Checkpoint path or "auto"')
     
     main(vars(parser.parse_args()))

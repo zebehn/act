@@ -6,6 +6,9 @@ data
 data_local
 .vscode
 _wandb
+.codex/
+.specify/
+act_mps_act_train/
 
 **/.DS_Store
 
