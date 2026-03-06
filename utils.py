@@ -16,6 +16,8 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.camera_names = camera_names
         self.norm_stats = norm_stats
         self.is_sim = None
+        if len(self.episode_ids) == 0:
+            raise ValueError('episode_ids must be non-empty')
         self.__getitem__(0) # initialize self.is_sim
 
     def __len__(self):
@@ -77,10 +79,10 @@ class EpisodicDataset(torch.utils.data.Dataset):
         return image_data, qpos_data, action_data, is_pad
 
 
-def get_norm_stats(dataset_dir, num_episodes):
+def get_norm_stats(dataset_dir, episode_ids):
     all_qpos_data = []
     all_action_data = []
-    for episode_idx in range(num_episodes):
+    for episode_idx in episode_ids:
         dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
         with h5py.File(dataset_path, 'r') as root:
             qpos = root['/observations/qpos'][()]
@@ -109,24 +111,31 @@ def get_norm_stats(dataset_dir, num_episodes):
     return stats
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, device=None):
+def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, device=None, episode_ids=None):
     print(f'\nData from: {dataset_dir}\n')
+    if episode_ids is None:
+        if num_episodes < 1:
+            raise ValueError('num_episodes must be >= 1')
+        episode_ids = list(range(num_episodes))
+    else:
+        episode_ids = list(episode_ids)
+        if len(episode_ids) == 0:
+            raise ValueError('episode_ids must be non-empty')
+
     # obtain train test split
-    if num_episodes < 1:
-        raise ValueError('num_episodes must be >= 1')
     train_ratio = 0.8
-    shuffled_indices = np.random.permutation(num_episodes)
-    split_idx = int(train_ratio * num_episodes)
-    train_indices = shuffled_indices[:split_idx]
-    val_indices = shuffled_indices[split_idx:]
+    shuffled_indices = np.random.permutation(episode_ids)
+    split_idx = int(train_ratio * len(episode_ids))
+    train_indices = shuffled_indices[:split_idx].tolist()
+    val_indices = shuffled_indices[split_idx:].tolist()
     if len(train_indices) == 0:
-        train_indices = shuffled_indices[:1]
+        train_indices = shuffled_indices[:1].tolist()
     if len(val_indices) == 0:
         # Reuse one episode for validation in minimal smoke-test datasets.
         val_indices = train_indices[:1]
 
     # obtain normalization stats for qpos and action
-    norm_stats = get_norm_stats(dataset_dir, num_episodes)
+    norm_stats = get_norm_stats(dataset_dir, episode_ids)
 
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats)

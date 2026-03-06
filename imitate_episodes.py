@@ -23,22 +23,14 @@ import IPython
 e = IPython.embed
 
 
-def count_available_episodes(dataset_dir):
+def list_available_episode_ids(dataset_dir):
     pattern = os.path.join(dataset_dir, 'episode_*.hdf5')
     episode_ids = []
     for path in glob.glob(pattern):
         match = re.search(r'episode_(\d+)\.hdf5$', os.path.basename(path))
         if match:
             episode_ids.append(int(match.group(1)))
-    if not episode_ids:
-        return 0
-    episode_ids = sorted(set(episode_ids))
-    contiguous = 0
-    for idx in episode_ids:
-        if idx != contiguous:
-            break
-        contiguous += 1
-    return contiguous
+    return sorted(set(episode_ids))
 
 
 def resolve_resume_checkpoint(resume_ckpt, ckpt_dir, device):
@@ -67,7 +59,7 @@ def resolve_resume_checkpoint(resume_ckpt, ckpt_dir, device):
 
 
 def main(args):
-    set_seed(1)
+    set_seed(args['seed'])
     device = resolve_device(args.get('device', 'auto'))
     print(f'Using device: {device}')
     # command line parameters
@@ -92,12 +84,16 @@ def main(args):
     num_episodes = task_config['num_episodes']
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
-    available_episodes = count_available_episodes(dataset_dir)
-    if available_episodes == 0:
+    available_episode_ids = list_available_episode_ids(dataset_dir)
+    if len(available_episode_ids) == 0:
         raise FileNotFoundError(f'No episode_*.hdf5 files found in dataset directory: {dataset_dir}')
-    if available_episodes < num_episodes:
-        print(f'Found {available_episodes} local episodes in {dataset_dir}; overriding requested num_episodes={num_episodes}.')
-        num_episodes = available_episodes
+    if len(available_episode_ids) < num_episodes:
+        print(
+            f'Found {len(available_episode_ids)} local episodes in {dataset_dir}; '
+            f'overriding requested num_episodes={num_episodes}.'
+        )
+        num_episodes = len(available_episode_ids)
+    selected_episode_ids = available_episode_ids[:num_episodes]
 
     # fixed parameters
     state_dim = 14
@@ -156,7 +152,13 @@ def main(args):
         exit()
 
     train_dataloader, val_dataloader, stats, _ = load_data(
-        dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, device=device
+        dataset_dir,
+        num_episodes,
+        camera_names,
+        batch_size_train,
+        batch_size_val,
+        device=device,
+        episode_ids=selected_episode_ids,
     )
 
     # save dataset stats
@@ -411,6 +413,19 @@ def train_bc(train_dataloader, val_dataloader, config):
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
+    if start_epoch >= num_epochs:
+        print(f'start_epoch ({start_epoch}) >= num_epochs ({num_epochs}); skipping training loop.')
+        with torch.inference_mode():
+            policy.eval()
+            epoch_dicts = []
+            for _, data in enumerate(val_dataloader):
+                forward_dict = forward_pass(data, policy, device)
+                epoch_dicts.append(forward_dict)
+            epoch_summary = compute_dict_mean(epoch_dicts)
+            validation_history.append(epoch_summary)
+            epoch_val_loss = epoch_summary['loss'].item()
+            best_ckpt_info = (max(start_epoch - 1, 0), epoch_val_loss, deepcopy(policy.state_dict()))
+
     for epoch in tqdm(range(start_epoch, num_epochs)):
         print(f'\nEpoch {epoch}')
         # validation
@@ -461,19 +476,31 @@ def train_bc(train_dataloader, val_dataloader, config):
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
     torch.save(policy.state_dict(), ckpt_path)
 
+    if best_ckpt_info is None:
+        if len(validation_history) > 0:
+            fallback_val = validation_history[-1]['loss'].item()
+        else:
+            fallback_val = float('inf')
+        best_ckpt_info = (max(start_epoch - 1, 0), fallback_val, deepcopy(policy.state_dict()))
+
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
     ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
     torch.save(best_state_dict, ckpt_path)
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
 
     # save training curves
-    plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
+    if len(train_history) > 0 and len(validation_history) > 0:
+        plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
+    else:
+        print('Skipping train/val plot generation: insufficient history.')
 
     return best_ckpt_info
 
 
 def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
     # save training curves
+    if len(train_history) == 0 or len(validation_history) == 0:
+        return
     for key in train_history[0]:
         plot_path = os.path.join(ckpt_dir, f'train_val_{key}_seed_{seed}.png')
         plt.figure()
