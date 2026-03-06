@@ -9,8 +9,40 @@ This repo contains the implementation of ACT, together with 2 simulated environm
 Transfer Cube and Bimanual Insertion. You can train and evaluate ACT in sim or real.
 For real, you would also need to install [ALOHA](https://github.com/tonyzhaozh/aloha).
 
+### Quickstart (Apple Silicon)
+```bash
+# 1) Setup env
+conda create -n aloha python=3.10 -y
+conda activate aloha
+python -m pip install --upgrade pip
+python -m pip install torch torchvision pyquaternion pyyaml rospkg pexpect \
+  mujoco==2.3.7 dm_control==1.0.14 opencv-python matplotlib einops packaging h5py ipython scipy gdown
+python -m pip install -e detr
+
+# 2) Download 50-episode sim dataset
+mkdir -p data
+python -m gdown --folder --remaining-ok \
+  "https://drive.google.com/drive/folders/1aRyoOhQwxhyt1J8XgEig4s6kzaw__LXj" \
+  -O data/sim_transfer_cube_scripted
+
+# 3) Train on MPS
+ACT_DATA_DIR="$(pwd)/data" PYTHONPATH="$(pwd)/detr" MPLCONFIGDIR=/tmp/matplotlib \
+python imitate_episodes.py --task_name sim_transfer_cube_scripted --ckpt_dir /tmp/act_mps_act_train \
+  --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
+  --num_epochs 2000 --lr 1e-5 --seed 0 --device mps
+
+# 4) Evaluate + save rollout videos
+ACT_DATA_DIR="$(pwd)/data" PYTHONPATH="$(pwd)/detr" MPLCONFIGDIR=/tmp/matplotlib \
+python imitate_episodes.py --eval --task_name sim_transfer_cube_scripted --ckpt_dir /tmp/act_mps_act_train \
+  --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
+  --num_epochs 2000 --lr 1e-5 --seed 0 --device mps
+```
+
 ### Updates:
 You can find all scripted/human demo for simulated environments [here](https://drive.google.com/drive/folders/1gPR03v05S1xiInoVJn7G7VJ9pDCnxq9O?usp=share_link).
+
+### Documentation
+- [macOS Apple Silicon (MPS) Installation, Data, Train, and Eval Guide](docs/MACOS_APPLE_SILICON_GUIDE.md)
 
 
 ### Repo Structure
@@ -74,7 +106,7 @@ To train ACT:
     --task_name sim_transfer_cube_scripted \
     --ckpt_dir <ckpt dir> \
     --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
-    --num_epochs 2000  --lr 1e-5 \
+    --num_epochs 2000  --lr 1e-5 --device auto \
     --seed 0
 
 
@@ -83,7 +115,7 @@ The success rate should be around 90% for transfer cube, and around 50% for inse
 To enable temporal ensembling, add flag ``--temporal_agg``.
 Videos will be saved to ``<ckpt_dir>`` for each rollout.
 You can also add ``--onscreen_render`` to see real-time rendering during evaluation.
+`--device auto` prefers MPS on Apple Silicon, then CUDA, then CPU. You can force `--device mps`.
 
 For real-world data where things can be harder to model, train for at least 5000 epochs or 3-4 times the length after the loss has plateaued.
 Please refer to [tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing) for more info.
-
