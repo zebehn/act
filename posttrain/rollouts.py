@@ -1,0 +1,323 @@
+from __future__ import annotations
+
+import math
+import os
+import pickle
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+from einops import rearrange
+from torch.distributions import Normal
+
+from constants import DT
+from device_utils import resolve_device
+from posttrain.common import build_act_policy, get_task_config, load_policy_checkpoint, save_json
+from posttrain.schema import ROLLOUT_SCHEMA_VERSION, save_rollout_record
+from sim_env import BOX_POSE, make_sim_env
+
+
+@dataclass
+class RolloutStats:
+    qpos_mean: np.ndarray
+    qpos_std: np.ndarray
+    action_mean: np.ndarray
+    action_std: np.ndarray
+
+    @classmethod
+    def from_pickle(cls, path: str) -> 'RolloutStats':
+        with open(path, 'rb') as f:
+            stats = pickle.load(f)
+        return cls(
+            qpos_mean=np.asarray(stats['qpos_mean'], dtype=np.float32),
+            qpos_std=np.asarray(stats['qpos_std'], dtype=np.float32),
+            action_mean=np.asarray(stats['action_mean'], dtype=np.float32),
+            action_std=np.asarray(stats['action_std'], dtype=np.float32),
+        )
+
+    def normalize_qpos(self, qpos: np.ndarray) -> np.ndarray:
+        return (qpos - self.qpos_mean) / self.qpos_std
+
+    def denormalize_action(self, action: np.ndarray) -> np.ndarray:
+        return action * self.action_std + self.action_mean
+
+    def normalize_action(self, action: np.ndarray) -> np.ndarray:
+        return (action - self.action_mean) / self.action_std
+
+
+def sample_initial_object_pose(task_name: str, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    if 'sim_transfer_cube' in task_name:
+        x = rng.uniform(0.0, 0.2)
+        y = rng.uniform(0.4, 0.6)
+        z = 0.05
+        quat = np.array([1, 0, 0, 0], dtype=np.float32)
+        return np.concatenate([np.array([x, y, z], dtype=np.float32), quat]).astype(np.float32)
+    if 'sim_insertion' in task_name:
+        peg = np.concatenate([
+            np.array([
+                rng.uniform(0.1, 0.2),
+                rng.uniform(0.4, 0.6),
+                0.05,
+            ], dtype=np.float32),
+            np.array([1, 0, 0, 0], dtype=np.float32),
+        ])
+        socket = np.concatenate([
+            np.array([
+                rng.uniform(-0.2, -0.1),
+                rng.uniform(0.4, 0.6),
+                0.05,
+            ], dtype=np.float32),
+            np.array([1, 0, 0, 0], dtype=np.float32),
+        ])
+        return np.concatenate([peg, socket]).astype(np.float32)
+    raise NotImplementedError(f'Unsupported task for rollout sampling: {task_name}')
+
+
+def set_task_initial_pose(task_name: str, pose: np.ndarray):
+    if 'sim_transfer_cube' in task_name or 'sim_insertion' in task_name:
+        BOX_POSE[0] = np.asarray(pose, dtype=np.float32)
+        return
+    raise NotImplementedError(f'Unsupported task for rollout reset pose: {task_name}')
+
+
+def get_image_from_ts(ts, camera_names: Sequence[str], device: torch.device) -> torch.Tensor:
+    curr_images = []
+    for cam_name in camera_names:
+        curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
+        curr_images.append(curr_image)
+    curr_image = np.stack(curr_images, axis=0)
+    return torch.from_numpy(curr_image / 255.0).float().to(device).unsqueeze(0)
+
+
+def _make_normal(mean: torch.Tensor, std: torch.Tensor) -> Normal:
+    return Normal(mean, std.clamp_min(1e-6))
+
+
+def _aggregate_normals(means: List[torch.Tensor], stds: List[torch.Tensor], decay_k: float = 0.01) -> Normal:
+    if len(means) == 1:
+        return _make_normal(means[0], stds[0])
+    weights = torch.exp(-decay_k * torch.arange(len(means), device=means[0].device, dtype=means[0].dtype))
+    weights = weights / weights.sum()
+    stacked_means = torch.stack(means, dim=0)
+    stacked_stds = torch.stack(stds, dim=0)
+    agg_mean = (stacked_means * weights.view(-1, 1, 1)).sum(dim=0)
+    agg_var = ((stacked_stds ** 2) * (weights.view(-1, 1, 1) ** 2)).sum(dim=0)
+    return _make_normal(agg_mean, agg_var.sqrt())
+
+
+class ChunkDistributionHistory:
+    def __init__(self, num_queries: int, temporal_agg: bool = True, decay_k: float = 0.01, detach_history: bool = True):
+        self.num_queries = num_queries
+        self.temporal_agg = temporal_agg
+        self.decay_k = decay_k
+        self.detach_history = detach_history
+        self.history: List[Dict[str, torch.Tensor]] = []
+
+    def step_distribution(self, policy, qpos: torch.Tensor, image: torch.Tensor, t: int) -> Tuple[Normal, torch.Tensor]:
+        if self.temporal_agg or not self.history or t % self.num_queries == 0:
+            policy_out = policy.get_action_distribution(qpos, image)
+            mean = policy_out['mean']
+            std = policy_out['dist'].stddev
+            value = policy_out['state_value']
+            record = {
+                'mean': mean.detach() if self.detach_history else mean,
+                'std': std.detach() if self.detach_history else std,
+                'value': value.detach() if self.detach_history else value,
+            }
+            self.history.append(record)
+        current_value = self.history[-1]['value']
+        if not self.temporal_agg:
+            query_idx = t % self.num_queries
+            dist = _make_normal(self.history[-1]['mean'][:, query_idx], self.history[-1]['std'][:, query_idx])
+            return dist, current_value
+
+        component_means: List[torch.Tensor] = []
+        component_stds: List[torch.Tensor] = []
+        for tau, record in enumerate(self.history):
+            query_idx = t - tau
+            if 0 <= query_idx < self.num_queries:
+                component_means.append(record['mean'][:, query_idx])
+                component_stds.append(record['std'][:, query_idx])
+        if not component_means:
+            raise RuntimeError(f'No temporal-agg components available for timestep {t}')
+        return _aggregate_normals(component_means, component_stds, decay_k=self.decay_k), current_value
+
+
+class TrajectoryReplay:
+    def __init__(self, task_name: str, camera_names: Sequence[str], initial_object_pose: np.ndarray, actions_env: np.ndarray):
+        self.task_name = task_name
+        self.camera_names = list(camera_names)
+        self.initial_object_pose = np.asarray(initial_object_pose, dtype=np.float32)
+        self.actions_env = np.asarray(actions_env, dtype=np.float32)
+
+    def iter_observations(self):
+        set_task_initial_pose(self.task_name, self.initial_object_pose)
+        env = make_sim_env(self.task_name)
+        ts = env.reset()
+        for action in self.actions_env:
+            obs = ts.observation
+            yield obs
+            ts = env.step(action)
+
+
+@torch.no_grad()
+def collect_rollouts(
+    task_name: str,
+    source_ckpt: str,
+    dataset_stats_path: str,
+    output_dir: str,
+    num_seed_groups: int,
+    rollouts_per_seed: int,
+    device: str = 'auto',
+    temporal_agg: bool = True,
+    deterministic: bool = False,
+    decay_k: float = 0.01,
+    max_timesteps: Optional[int] = None,
+    source_label: str = 'bc',
+    seed_start: int = 1000,
+    policy_overrides: Optional[Dict[str, Any]] = None,
+):
+    device_obj = resolve_device(device)
+    task_config = get_task_config(task_name)
+    camera_names = task_config['camera_names']
+    episode_len = int(max_timesteps or task_config['episode_len'])
+    stats = RolloutStats.from_pickle(dataset_stats_path)
+    policy = build_act_policy(task_name, device=device, overrides=policy_overrides)
+    load_policy_checkpoint(policy, source_ckpt, device=device, strict=True)
+    policy.eval()
+
+    output_dir = str(Path(output_dir))
+    os.makedirs(output_dir, exist_ok=True)
+    save_json(
+        os.path.join(output_dir, 'collection_meta.json'),
+        {
+            'schema_version': ROLLOUT_SCHEMA_VERSION,
+            'task_name': task_name,
+            'source_checkpoint': source_ckpt,
+            'dataset_stats_path': dataset_stats_path,
+            'camera_names': camera_names,
+            'num_seed_groups': num_seed_groups,
+            'rollouts_per_seed': rollouts_per_seed,
+            'temporal_agg': temporal_agg,
+            'deterministic': deterministic,
+            'device': str(device_obj),
+            'source_label': source_label,
+            'created_at_unix': time.time(),
+        },
+    )
+
+    env = make_sim_env(task_name)
+    env_max_reward = env.task.max_reward
+    num_queries = policy.model.num_queries
+
+    for seed_offset in range(num_seed_groups):
+        seed = seed_start + seed_offset
+        initial_pose = sample_initial_object_pose(task_name, seed)
+        for candidate_index in range(rollouts_per_seed):
+            rollout_id = f'seed{seed:04d}-cand{candidate_index:02d}'
+            set_task_initial_pose(task_name, initial_pose)
+            ts = env.reset()
+            history = ChunkDistributionHistory(num_queries=num_queries, temporal_agg=temporal_agg, decay_k=decay_k, detach_history=True)
+            actions_norm = []
+            actions_env = []
+            rewards = []
+            qpos_seq = []
+            for t in range(episode_len):
+                qpos_raw = np.asarray(ts.observation['qpos'], dtype=np.float32)
+                qpos_seq.append(qpos_raw)
+                qpos = torch.from_numpy(stats.normalize_qpos(qpos_raw)).float().to(device_obj).unsqueeze(0)
+                image = get_image_from_ts(ts, camera_names, device_obj)
+                dist, value = history.step_distribution(policy, qpos, image, t)
+                raw_action = dist.mean if deterministic else dist.sample()
+                raw_action_np = raw_action.squeeze(0).detach().cpu().numpy().astype(np.float32)
+                env_action = stats.denormalize_action(raw_action_np).astype(np.float32)
+                ts = env.step(env_action)
+                actions_norm.append(raw_action_np)
+                actions_env.append(env_action)
+                rewards.append(float(ts.reward if ts.reward is not None else 0.0))
+            rewards_np = np.asarray(rewards, dtype=np.float32)
+            actions_norm_np = np.asarray(actions_norm, dtype=np.float32)
+            actions_env_np = np.asarray(actions_env, dtype=np.float32)
+            qpos_seq_np = np.asarray(qpos_seq, dtype=np.float32)
+            highest_reward = float(np.max(rewards_np)) if len(rewards_np) else 0.0
+            episode_return = float(np.sum(rewards_np))
+            success = bool(highest_reward == env_max_reward)
+            metadata = {
+                'schema_version': ROLLOUT_SCHEMA_VERSION,
+                'rollout_id': rollout_id,
+                'task_name': task_name,
+                'source_checkpoint': source_ckpt,
+                'source_label': source_label,
+                'seed': seed,
+                'candidate_index': candidate_index,
+                'temporal_agg': temporal_agg,
+                'deterministic': deterministic,
+                'initial_object_pose': initial_pose.tolist(),
+                'num_steps': int(len(actions_env_np)),
+                'episode_return': episode_return,
+                'highest_reward': highest_reward,
+                'success': success,
+                'env_max_reward': float(env_max_reward),
+            }
+            arrays = {
+                'actions_norm': actions_norm_np,
+                'actions_env': actions_env_np,
+                'rewards': rewards_np,
+                'qpos': qpos_seq_np,
+                'actions': actions_env_np,
+            }
+            save_rollout_record(output_dir, metadata, arrays)
+
+
+def trajectory_logprob(
+    policy,
+    task_name: str,
+    camera_names: Sequence[str],
+    stats: RolloutStats,
+    initial_object_pose: np.ndarray,
+    actions_env: np.ndarray,
+    actions_norm: np.ndarray,
+    device: str = 'auto',
+    temporal_agg: bool = True,
+    decay_k: float = 0.01,
+    window_start: int = 0,
+    window_length: Optional[int] = None,
+):
+    device_obj = resolve_device(device)
+    replay = TrajectoryReplay(task_name, camera_names, initial_object_pose, actions_env)
+    history = ChunkDistributionHistory(
+        num_queries=policy.model.num_queries,
+        temporal_agg=temporal_agg,
+        decay_k=decay_k,
+        detach_history=False,
+    )
+    total_log_prob = None
+    total_entropy = None
+    end = len(actions_norm) if window_length is None else min(len(actions_norm), window_start + window_length)
+    value_samples = []
+    for t, obs in enumerate(replay.iter_observations()):
+        qpos_raw = np.asarray(obs['qpos'], dtype=np.float32)
+        qpos = torch.from_numpy(stats.normalize_qpos(qpos_raw)).float().to(device_obj).unsqueeze(0)
+        image = get_image_from_ts(type('TS', (), {'observation': obs}), camera_names, device_obj)
+        dist, value = history.step_distribution(policy, qpos, image, t)
+        if window_start <= t < end:
+            action = torch.from_numpy(actions_norm[t]).float().to(device_obj).unsqueeze(0)
+            log_prob = dist.log_prob(action).sum(dim=-1)
+            entropy = dist.entropy().sum(dim=-1)
+            total_log_prob = log_prob if total_log_prob is None else total_log_prob + log_prob
+            total_entropy = entropy if total_entropy is None else total_entropy + entropy
+            value_samples.append(value)
+        if t + 1 >= len(actions_norm):
+            break
+    if total_log_prob is None:
+        raise ValueError('No log-prob terms accumulated; check window_start/window_length')
+    mean_value = torch.stack(value_samples).mean(dim=0) if value_samples else torch.zeros((1,), device=device_obj)
+    return {
+        'log_prob': total_log_prob,
+        'entropy': total_entropy,
+        'value': mean_value,
+    }

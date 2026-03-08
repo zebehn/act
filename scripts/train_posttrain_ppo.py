@@ -1,0 +1,13 @@
+#!/usr/bin/env python
+import sys
+from pathlib import Path
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+if str(ROOT_DIR / 'detr') not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR / 'detr'))
+
+from posttrain.ppo import parse_args, train_ppo_like
+
+if __name__ == '__main__':
+    train_ppo_like(parse_args())

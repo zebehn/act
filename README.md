@@ -6,7 +6,7 @@ This fork adds Apple Silicon support and experiment documentation on top of the 
 - Device support: `--device auto|mps|cuda|cpu` (`auto` prefers MPS on macOS).
 - Resume support: `--resume_ckpt auto` to continue from latest valid checkpoint.
 - Full macOS setup + run guide: [docs/MACOS_APPLE_SILICON_GUIDE.md](docs/MACOS_APPLE_SILICON_GUIDE.md)
-- Experiment reports: [transfer cube ACT on MPS](docs/reports/EXPERIMENT_REPORT_MPS_ACT.md), [insertion ACT on MPS](docs/reports/EXPERIMENT_REPORT_MPS_INSERTION_ACT.md)
+- Experiment reports: [transfer cube ACT on MPS](docs/reports/EXPERIMENT_REPORT_MPS_ACT.md), [insertion ACT on MPS](docs/reports/EXPERIMENT_REPORT_MPS_INSERTION_ACT.md), [post-training RL pilot on transfer cube](docs/reports/EXPERIMENT_REPORT_ACT_POSTTRAIN_TRANSFER_CUBE.md)
 
 ### Quickstart (Apple Silicon)
 ```bash
@@ -82,6 +82,32 @@ The sweep helper maintains a convenience symlink when available:
 If `SOURCE_CKPT_NAME` is not set, the rollout-best eval helper prefers `<ckpt_dir>/policy_rollout_best.ckpt` automatically and falls back to other common checkpoint names when needed.
 
 For benchmark-style simulator rollouts, prefer evaluating the rollout-best checkpoint with `--temporal_agg` rather than assuming the minimum-validation-loss checkpoint is best in closed-loop control.
+
+### Post-training RL extension (simulator-only, ACT-only)
+This fork now includes a documented pilot post-training pipeline for ACT:
+- Phase 1: DPO-style preference optimization from simulator rollouts
+- Phase 2: PPO-like RL fine-tuning
+
+Primary docs:
+- `docs/posttraining-act-rl.md`
+- `docs/posttraining-act-rl-usage.md`
+- `docs/posttraining-act-rl-troubleshooting.md`
+- `docs/posttraining-act-rl-reproducibility.md`
+- `docs/posttraining-act-rl-schema.md`
+- `docs/reports/EXPERIMENT_REPORT_ACT_POSTTRAIN_TRANSFER_CUBE.md`
+
+Main scripts:
+- `scripts/collect_posttrain_rollouts.py`
+- `scripts/build_posttrain_preferences.py`
+- `scripts/train_posttrain_dpo.py`
+- `scripts/train_posttrain_ppo.py`
+- `scripts/evaluate_posttrain_checkpoint.py`
+- `scripts/eval_posttrain_sweep.sh`
+
+Smoke checks:
+- `scripts/posttrain_regression_smoke_tests.py`
+- `scripts/posttrain_cli_smoke.sh`
+- `scripts/posttrain_local_smoke.sh`
 
 ---
 ## Original README (ACT)

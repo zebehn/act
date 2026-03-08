@@ -51,6 +51,8 @@ class DETRVAE(nn.Module):
         hidden_dim = transformer.d_model
         self.action_head = nn.Linear(hidden_dim, state_dim)
         self.is_pad_head = nn.Linear(hidden_dim, 1)
+        self.value_head = nn.Linear(hidden_dim, 1)
+        self.action_log_std = nn.Parameter(torch.full((state_dim,), -2.0, dtype=torch.float32))
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         if backbones is not None:
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
@@ -75,7 +77,7 @@ class DETRVAE(nn.Module):
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
 
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None):
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None, return_aux=False):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -136,6 +138,14 @@ class DETRVAE(nn.Module):
             hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
+        state_value = self.value_head(hs.mean(dim=1))
+        if return_aux:
+            aux = {
+                'hidden_states': hs,
+                'state_value': state_value,
+                'action_log_std': self.action_log_std.view(1, 1, -1).expand_as(a_hat),
+            }
+            return a_hat, is_pad_hat, [mu, logvar], aux
         return a_hat, is_pad_hat, [mu, logvar]
 
 
