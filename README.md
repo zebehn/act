@@ -6,6 +6,7 @@ This fork adds Apple Silicon support and experiment documentation on top of the 
 - Device support: `--device auto|mps|cuda|cpu` (`auto` prefers MPS on macOS).
 - Resume support: `--resume_ckpt auto` to continue from latest valid checkpoint.
 - Full macOS setup + run guide: [docs/MACOS_APPLE_SILICON_GUIDE.md](docs/MACOS_APPLE_SILICON_GUIDE.md)
+- Experiment reports: [transfer cube ACT on MPS](docs/reports/EXPERIMENT_REPORT_MPS_ACT.md), [insertion ACT on MPS](docs/reports/EXPERIMENT_REPORT_MPS_INSERTION_ACT.md)
 
 ### Quickstart (Apple Silicon)
 ```bash
@@ -29,12 +30,58 @@ python imitate_episodes.py --task_name sim_transfer_cube_scripted --ckpt_dir /tm
   --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
   --num_epochs 2000 --lr 1e-5 --seed 0 --device mps
 
-# 4) Evaluate + save rollout videos
+# 4) Evaluate + save rollout videos (temporal aggregation recommended)
 ACT_DATA_DIR="$(pwd)/data" PYTHONPATH="$(pwd)/detr" MPLCONFIGDIR=/tmp/matplotlib \
 python imitate_episodes.py --eval --task_name sim_transfer_cube_scripted --ckpt_dir /tmp/act_mps_act_train \
   --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
-  --num_epochs 2000 --lr 1e-5 --seed 0 --device mps
+  --num_epochs 2000 --lr 1e-5 --seed 0 --device mps --temporal_agg
 ```
+
+### Rollout-best checkpoint workflow (recommended)
+In this fork, `policy_best.ckpt` is selected by **offline validation loss**, but the best simulator rollout checkpoint can be different. The rollout-best helper workflow now works for both `sim_transfer_cube_scripted` and `sim_insertion_scripted` while keeping the existing transfer-cube entry points available as shortcuts.
+
+Generic helpers:
+- `scripts/train_act_mps_with_rollout_best.sh` -- train ACT for `TASK_NAME`, then sweep checkpoints with temporal aggregation and preserve the rollout-best checkpoint.
+- `scripts/eval_checkpoint_sweep_temporal_agg.sh` -- compare multiple saved checkpoints for `TASK_NAME` by rollout success/return.
+- `scripts/eval_rollout_best_temporal_agg.sh` -- evaluate the current rollout-best checkpoint for `TASK_NAME`.
+
+Transfer-cube compatibility wrappers:
+- `scripts/train_transfer_cube_act_mps_with_rollout_best.sh`
+- `scripts/eval_checkpoint_sweep_transfer_cube_temporal_agg.sh`
+- `scripts/eval_rollout_best_transfer_cube_temporal_agg.sh`
+
+Key environment variables:
+- `TASK_NAME` -- simulator task to run, e.g. `sim_transfer_cube_scripted` or `sim_insertion_scripted`
+- `CKPT_DIR` / `SOURCE_CKPT_DIR` -- checkpoint directory (recommended to keep separate per task)
+- `SAVE_VIDEOS=0` -- skip rollout video generation during sweeps/eval for faster turnaround
+- `DRY_RUN=1` -- print the generated commands without running training/evaluation
+
+Useful eval flags in `imitate_episodes.py`:
+- `--eval_ckpt_names ...` -- evaluate one or more specific checkpoint filenames inside `--ckpt_dir`
+- `--no_save_episode` -- skip rollout video generation during sweeps for faster turnaround
+- `--temporal_agg` -- enable temporal ensembling during evaluation
+
+Examples:
+```bash
+# Transfer cube: existing shortcut entry points still work
+SAVE_VIDEOS=0 bash scripts/train_transfer_cube_act_mps_with_rollout_best.sh
+SAVE_VIDEOS=0 bash scripts/eval_checkpoint_sweep_transfer_cube_temporal_agg.sh
+SAVE_VIDEOS=0 bash scripts/eval_rollout_best_transfer_cube_temporal_agg.sh
+
+# Insertion: use the generic task-parameterized workflow
+TASK_NAME=sim_insertion_scripted CKPT_DIR=/tmp/act_insertion_mps_act_train SAVE_VIDEOS=0 bash scripts/train_act_mps_with_rollout_best.sh
+
+TASK_NAME=sim_insertion_scripted SOURCE_CKPT_DIR=/tmp/act_insertion_mps_act_train SAVE_VIDEOS=0 bash scripts/eval_checkpoint_sweep_temporal_agg.sh
+
+TASK_NAME=sim_insertion_scripted SOURCE_CKPT_DIR=/tmp/act_insertion_mps_act_train SAVE_VIDEOS=0 bash scripts/eval_rollout_best_temporal_agg.sh
+```
+
+The sweep helper maintains a convenience symlink when available:
+- `<ckpt_dir>/policy_rollout_best.ckpt`
+
+If `SOURCE_CKPT_NAME` is not set, the rollout-best eval helper prefers `<ckpt_dir>/policy_rollout_best.ckpt` automatically and falls back to other common checkpoint names when needed.
+
+For benchmark-style simulator rollouts, prefer evaluating the rollout-best checkpoint with `--temporal_agg` rather than assuming the minimum-validation-loss checkpoint is best in closed-loop control.
 
 ---
 ## Original README (ACT)

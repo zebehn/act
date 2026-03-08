@@ -105,12 +105,26 @@ python imitate_episodes.py \
   --ckpt_dir /tmp/act_mps_act_train \
   --policy_class ACT \
   --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
-  --num_epochs 2000 --lr 1e-5 --seed 0 --device mps
+  --num_epochs 2000 --lr 1e-5 --seed 0 --device mps --temporal_agg
 ```
 
 Outputs:
 - Metrics: `/tmp/act_mps_act_train/result_policy_best.txt`
 - Videos: `/tmp/act_mps_act_train/video0.mp4` ... `/tmp/act_mps_act_train/video49.mp4`
+
+### Recommended: preserve a rollout-best checkpoint
+In this fork, the checkpoint with the lowest offline validation loss is not always the best checkpoint for simulator rollout success. The helper scripts can automatically sweep checkpoints with temporal aggregation and preserve the best rollout checkpoint:
+
+```bash
+SAVE_VIDEOS=0 bash scripts/train_transfer_cube_act_mps_with_rollout_best.sh
+```
+
+This workflow creates a convenience symlink when available:
+- `/tmp/act_mps_act_train/policy_rollout_best.ckpt`
+
+Related reports:
+- `docs/reports/EXPERIMENT_REPORT_MPS_ACT.md`
+- `docs/reports/EXPERIMENT_REPORT_MPS_INSERTION_ACT.md`
 
 ## 7. Troubleshooting
 - `MPS backend requested but not available`: install Apple Silicon PyTorch build and verify MPS availability.

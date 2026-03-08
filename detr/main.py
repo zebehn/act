@@ -64,6 +64,8 @@ def get_args_parser():
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
     parser.add_argument('--chunk_size', action='store', type=int, help='chunk_size', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    parser.add_argument('--eval_ckpt_names', nargs='+', required=False)
+    parser.add_argument('--no_save_episode', action='store_true')
     parser.add_argument('--device', default='auto', choices=['auto', 'mps', 'cuda', 'cpu'])
     parser.add_argument('--resume_ckpt', action='store', type=str, required=False)
 

@@ -140,10 +140,11 @@ def main(args):
     }
 
     if is_eval:
-        ckpt_names = [f'policy_best.ckpt']
+        ckpt_names = args.get('eval_ckpt_names') or ['policy_best.ckpt']
+        save_episode = not args.get('no_save_episode', False)
         results = []
         for ckpt_name in ckpt_names:
-            success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True)
+            success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=save_episode)
             results.append([ckpt_name, success_rate, avg_return])
 
         for ckpt_name, success_rate, avg_return in results:
@@ -318,7 +319,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         k = 0.01
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
                         exp_weights = exp_weights / exp_weights.sum()
-                        exp_weights = torch.from_numpy(exp_weights).to(device).unsqueeze(dim=1)
+                        exp_weights = torch.from_numpy(exp_weights).float().to(device).unsqueeze(dim=1)
                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
                     else:
                         raw_action = all_actions[:, t % query_frequency]
@@ -534,6 +535,8 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    parser.add_argument('--eval_ckpt_names', nargs='+', default=['policy_best.ckpt'], help='Checkpoint filename(s) inside ckpt_dir to evaluate when --eval is set')
+    parser.add_argument('--no_save_episode', action='store_true', help='Disable rollout video saving during --eval')
     parser.add_argument('--device', action='store', type=str, default='auto', choices=['auto', 'mps', 'cuda', 'cpu'])
     parser.add_argument('--resume_ckpt', action='store', type=str, default=None, help='Checkpoint path or "auto"')
     
