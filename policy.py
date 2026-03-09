@@ -24,10 +24,18 @@ class ACTPolicy(nn.Module):
                                          std=[0.229, 0.224, 0.225])
         return normalize(image)
 
-    def _forward_model(self, qpos, image, actions=None, is_pad=None, return_aux=False):
+    def _forward_model(self, qpos, image, actions=None, is_pad=None, return_aux=False, posterior_decode_mode='sample'):
         env_state = None
         image = self._normalize_image(image)
-        return self.model(qpos, image, env_state, actions, is_pad, return_aux=return_aux)
+        return self.model(
+            qpos,
+            image,
+            env_state,
+            actions,
+            is_pad,
+            return_aux=return_aux,
+            posterior_decode_mode=posterior_decode_mode,
+        )
 
     def __call__(self, qpos, image, actions=None, is_pad=None):
         if actions is not None:  # training time
@@ -86,6 +94,39 @@ class ACTPolicy(nn.Module):
             'mean': dist.mean,
             'std': dist.stddev,
             'query_index': query_index,
+        }
+
+    def score_action_chunk(self, qpos, image, actions, is_pad, posterior_decode_mode='mean', kl_coef=1.0):
+        actions = actions[:, :self.model.num_queries]
+        is_pad = is_pad[:, :self.model.num_queries]
+        a_hat, _, (mu, logvar), aux = self._forward_model(
+            qpos,
+            image,
+            actions,
+            is_pad,
+            return_aux=True,
+            posterior_decode_mode=posterior_decode_mode,
+        )
+        dist = Normal(a_hat, aux['action_log_std'].exp())
+        valid_mask = (~is_pad).unsqueeze(-1).float()
+        log_prob_terms = dist.log_prob(actions) * valid_mask
+        entropy_terms = dist.entropy() * valid_mask
+        total_log_prob = log_prob_terms.sum(dim=(1, 2))
+        total_entropy = entropy_terms.sum(dim=(1, 2))
+        token_count = valid_mask.sum(dim=(1, 2)).clamp_min(1.0)
+        total_kld, _, _ = kl_divergence(mu, logvar)
+        kl_value = total_kld.view(1) if total_kld.ndim == 0 else total_kld
+        score = total_log_prob - kl_coef * kl_value
+        return {
+            'score': score,
+            'mean_score': score / token_count,
+            'log_prob': total_log_prob,
+            'mean_log_prob': total_log_prob / token_count,
+            'entropy': total_entropy,
+            'mean_entropy': total_entropy / token_count,
+            'kl': kl_value,
+            'token_count': token_count.to(dtype=torch.int64),
+            'posterior_decode_mode': posterior_decode_mode,
         }
 
     def load_state_dict(self, state_dict, strict=True):

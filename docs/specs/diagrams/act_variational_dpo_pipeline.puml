@@ -1,0 +1,34 @@
+@startuml
+title ACT Variational DPO Training and Evaluation Pipeline
+skinparam shadowing false
+skinparam defaultTextAlignment center
+
+start
+:Load BC checkpoint\n(policy_best or policy_rollout_best);
+:Collect rollout candidates\nwith temporal aggregation;
+if (Need deterministic anchor candidates?) then (yes)
+  :Use deterministic anchor candidate(s)\n+ exploratory variants;
+else (no)
+  :Use exploratory variants only;
+endif
+:Group rollouts by seed / initial state;
+:Construct chosen/rejected rollout pairs;
+:Extract fixed preference windows;
+:Replay chosen / rejected windows;
+:Build chunk tensors + pad masks;
+:Score chunks with ACT training path\n(variational_chunk_elbo mode);
+:Aggregate chosen/rejected window scores;
+:Compute variational DPO loss\n(+ optional BC regularization);
+:Update train policy\nagainst frozen reference;
+if (Checkpoint interval reached?) then (yes)
+  :Save policy_pref_best / last;
+endif
+if (Training finished?) then (yes)
+  :Run 50-rollout evaluation\nwith same temporal-agg protocol;
+  :Compare against BC baseline;
+  :Append result to progress log;
+  stop
+else (no)
+  :Next DPO step;
+endif
+@enduml

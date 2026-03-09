@@ -1,0 +1,65 @@
+@startuml
+title ACT Variational DPO Architecture
+skinparam shadowing false
+skinparam packageStyle rectangle
+skinparam defaultTextAlignment center
+
+actor "Preference Dataset\n(chosen / rejected windows)" as prefs
+actor "Simulator Rollouts\n(seed-grouped candidates)" as rollouts
+
+package "ACT Backbone" {
+  rectangle "Observation Context\no_t" as obs
+  rectangle "Chunk Actions\na_t^(H)" as chunk
+  rectangle "Encoder\nq_phi(z | o, a)" as encoder
+  rectangle "Latent Posterior\nmu, logvar" as posterior
+  rectangle "Posterior Decode\nmean or sample" as postdecode
+  rectangle "Decoder\np_theta(a | o, z)" as decoder
+  rectangle "Gaussian Chunk Density\nmu_theta, sigma_theta" as gaussian
+  rectangle "Chunk ELBO Score\nlog p_theta(a|o,z) - KL" as elbo
+}
+
+package "Preference Optimization" {
+  rectangle "Chosen Window Score\nS_theta(W+)" as chosen
+  rectangle "Rejected Window Score\nS_theta(W-)" as rejected
+  rectangle "Reference Scores\nS_ref(W+), S_ref(W-)" as refscores
+  rectangle "Variational DPO Margin Loss" as vdpoloss
+  rectangle "Optional BC Regularizer" as bcreg
+  rectangle "Updated ACT Policy" as updated
+}
+
+rollouts --> prefs : ranked by\nsuccess / return
+prefs --> obs
+prefs --> chunk
+obs --> encoder
+chunk --> encoder
+encoder --> posterior
+posterior --> postdecode
+postdecode --> decoder
+obs --> decoder
+chunk --> gaussian : target chunk
+encoder --> elbo : KL term
+postdecode --> decoder
+
+decoder --> gaussian : predicted chunk dist
+
+gaussian --> elbo : masked log-likelihood
+elbo --> chosen : chosen window aggregate
+elbo --> rejected : rejected window aggregate
+chosen --> vdpoloss
+rejected --> vdpoloss
+refscores --> vdpoloss
+bcreg --> updated
+vdpoloss --> updated
+
+note right of elbo
+Per-chunk score used by
+variational DPO mode.
+Window score is sum/mean
+across chunk start times.
+end note
+
+note bottom of vdpoloss
+Loss = -log sigma(beta * [(S_theta(W+) - S_theta(W-))
+                        - (S_ref(W+) - S_ref(W-))])
+end note
+@enduml

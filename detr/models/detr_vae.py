@@ -77,7 +77,7 @@ class DETRVAE(nn.Module):
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
 
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None, return_aux=False):
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None, return_aux=False, posterior_decode_mode='sample'):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -108,7 +108,12 @@ class DETRVAE(nn.Module):
             latent_info = self.latent_proj(encoder_output)
             mu = latent_info[:, :self.latent_dim]
             logvar = latent_info[:, self.latent_dim:]
-            latent_sample = reparametrize(mu, logvar)
+            if posterior_decode_mode == 'mean':
+                latent_sample = mu
+            elif posterior_decode_mode == 'sample':
+                latent_sample = reparametrize(mu, logvar)
+            else:
+                raise ValueError(f'Unsupported posterior_decode_mode: {posterior_decode_mode}')
             latent_input = self.latent_out_proj(latent_sample)
         else:
             mu = logvar = None
@@ -144,6 +149,8 @@ class DETRVAE(nn.Module):
                 'hidden_states': hs,
                 'state_value': state_value,
                 'action_log_std': self.action_log_std.view(1, 1, -1).expand_as(a_hat),
+                'latent_sample': latent_sample,
+                'posterior_decode_mode': posterior_decode_mode,
             }
             return a_hat, is_pad_hat, [mu, logvar], aux
         return a_hat, is_pad_hat, [mu, logvar]
