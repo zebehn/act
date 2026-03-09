@@ -1,0 +1,91 @@
+@startuml
+title ACT Internal Model Structure
+skinparam shadowing false
+skinparam packageStyle rectangle
+skinparam defaultTextAlignment center
+
+package "Inputs" {
+  rectangle "Observation\nqpos + multi-camera image" as obs
+  rectangle "Action Chunk\na_t^(H)" as actions
+  rectangle "Pad Mask" as pad
+}
+
+package "Training-time Latent Path" {
+  rectangle "Action Projection" as actproj
+  rectangle "Joint Projection" as jointproj
+  rectangle "[CLS] + Positional Encoding" as clspos
+  rectangle "Transformer Encoder" as encoder
+  rectangle "Latent Projection" as latproj
+  rectangle "Posterior Params\nmu, logvar" as post
+  rectangle "Posterior Decode Mode\nmean or sample" as postmode
+  rectangle "Latent Output Projection" as latout
+}
+
+package "Observation Backbone" {
+  rectangle "Image Backbone(s)" as backbone
+  rectangle "Input Projection" as inproj
+  rectangle "Robot State Projection" as qproj
+}
+
+package "Chunk Decoder" {
+  rectangle "Transformer Decoder" as decoder
+  rectangle "Query Embeddings" as queries
+  rectangle "Additional Positional Embeddings" as addpos
+  rectangle "Action Head" as actionhead
+  rectangle "Pad Head" as padhead
+  rectangle "Value Head" as valuehead
+  rectangle "Action Log-Std" as actionstd
+}
+
+package "Outputs" {
+  rectangle "Chunk Mean\na_hat" as ahat
+  rectangle "Chunk Gaussian\nN(a_hat, sigma)" as gauss
+  rectangle "Pad Logits" as padlogits
+  rectangle "State Value" as value
+}
+
+actions --> actproj
+obs --> jointproj
+pad --> clspos
+actproj --> clspos
+jointproj --> clspos
+clspos --> encoder
+encoder --> latproj
+latproj --> post
+post --> postmode
+postmode --> latout
+
+obs --> backbone
+backbone --> inproj
+obs --> qproj
+
+latout --> decoder
+inproj --> decoder
+qproj --> decoder
+queries --> decoder
+addpos --> decoder
+
+decoder --> actionhead
+decoder --> padhead
+decoder --> valuehead
+actionstd --> gauss
+actionhead --> ahat
+ahat --> gauss
+padhead --> padlogits
+valuehead --> value
+
+note right of post
+At inference in the original ACT path,
+a latent prior or fixed latent surrogate is used.
+In variational chunk scoring,
+chosen/rejected chunks are scored via the
+training-time latent path.
+end note
+
+note bottom of gauss
+Used in current implementation for:
+- Gaussian replay scoring
+- variational chunk ELBO scoring
+  together with KL(mu, logvar)
+end note
+@enduml

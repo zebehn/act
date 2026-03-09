@@ -1,0 +1,65 @@
+@startuml
+title ACT DPO Scoring Comparison: Surrogate vs Variational
+skinparam shadowing false
+skinparam defaultTextAlignment center
+skinparam packageStyle rectangle
+
+package "Current Surrogate Scoring" {
+  rectangle "Replay observation\no_t" as s_obs
+  rectangle "Replay target chunk\na_t^(H)" as s_chunk
+  rectangle "Inference-time ACT\nget_action_distribution" as s_policy
+  rectangle "Gaussian chunk score\nlog p(a|o) surrogate" as s_score
+  rectangle "Window aggregate" as s_window
+
+  s_obs --> s_policy
+  s_policy --> s_score
+  s_chunk --> s_score
+  s_score --> s_window
+}
+
+package "Revised Variational Scoring" {
+  rectangle "Replay observation\no_t" as v_obs
+  rectangle "Replay target chunk\na_t^(H) + pad mask" as v_chunk
+  rectangle "Training-time ACT\nscore_action_chunk" as v_policy
+  rectangle "Encoder\nq(z|o,a)" as v_enc
+  rectangle "Posterior params\nmu, logvar" as v_post
+  rectangle "Posterior decode\nmean or sample" as v_decode
+  rectangle "Decoder Gaussian\np(a|o,z)" as v_dec
+  rectangle "Chunk ELBO-like score\nlog p(a|o,z) - KL" as v_score
+  rectangle "Window aggregate" as v_window
+
+  v_obs --> v_policy
+  v_chunk --> v_policy
+  v_policy --> v_enc
+  v_enc --> v_post
+  v_post --> v_decode
+  v_decode --> v_dec
+  v_chunk --> v_dec
+  v_dec --> v_score
+  v_post --> v_score
+  v_score --> v_window
+}
+
+note bottom of s_window
+Pros:
+- simple
+- fast
+- worked well empirically in some runs
+
+Cons:
+- not a strict ACT latent likelihood
+- easier for reviewers to view as
+  DPO-like surrogate ranking
+end note
+
+note bottom of v_window
+Pros:
+- grounded in ACT training-time latent path
+- closer to a principled chunk likelihood objective
+- easier to justify as variational DPO
+
+Cons:
+- more modeling choices
+- may require more tuning
+end note
+@enduml

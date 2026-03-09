@@ -13,7 +13,7 @@ from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
 
 from posttrain.common import build_act_policy, load_policy_checkpoint, load_training_state, save_policy_checkpoint, save_training_state, append_jsonl, save_json, read_jsonl
-from posttrain.rollouts import RolloutStats, trajectory_logprob
+from posttrain.rollouts import RolloutStats, trajectory_chunk_score, trajectory_logprob
 from posttrain.schema import load_preference_pairs, load_rollout_arrays, load_rollout_metadata
 
 
@@ -23,6 +23,21 @@ def dpo_loss(chosen_logp, rejected_logp, ref_chosen_logp, ref_rejected_logp, bet
     return loss, margin.mean().detach()
 
 
+
+
+def _select_preference_score(stat: Dict[str, torch.Tensor], reduction: str, score_mode: str):
+    if score_mode == 'variational_chunk_elbo':
+        if reduction == 'sum':
+            return stat['score']
+        if reduction == 'mean':
+            return stat['mean_score']
+    else:
+        if reduction == 'sum':
+            return stat['log_prob']
+        if reduction == 'mean':
+            return stat['mean_log_prob']
+    raise ValueError(f'Unsupported reduction={reduction} for score_mode={score_mode}')
+
 def _resolve_pair_rollouts(header: Dict[str, Any], pair: Dict[str, Any]):
     rollout_dir = header['rollout_dir']
     chosen_meta = load_rollout_metadata(rollout_dir, pair['chosen_rollout_id'])
@@ -31,6 +46,45 @@ def _resolve_pair_rollouts(header: Dict[str, Any], pair: Dict[str, Any]):
     rejected_arrays = load_rollout_arrays(rollout_dir, pair['rejected_rollout_id'])
     return rollout_dir, chosen_meta, chosen_arrays, rejected_meta, rejected_arrays
 
+
+
+
+def _compute_preference_stat(
+    policy,
+    args,
+    header,
+    stats,
+    rollout_meta,
+    rollout_arrays,
+    window_start: int,
+    window_length: int,
+):
+    common_kwargs = dict(
+        task_name=args.task_name,
+        camera_names=header.get('camera_names', ['top']),
+        stats=stats,
+        initial_object_pose=rollout_meta['initial_object_pose'],
+        actions_env=rollout_arrays['actions_env'],
+        actions_norm=rollout_arrays['actions_norm'],
+        device=args.device,
+        window_start=window_start,
+        window_length=window_length,
+    )
+    if args.score_mode == 'gaussian_replay':
+        return trajectory_logprob(
+            policy,
+            temporal_agg=args.temporal_agg,
+            decay_k=args.decay_k,
+            **common_kwargs,
+        )
+    if args.score_mode == 'variational_chunk_elbo':
+        return trajectory_chunk_score(
+            policy,
+            posterior_decode_mode=args.posterior_decode_mode,
+            kl_coef=args.variational_kl_coef,
+            **common_kwargs,
+        )
+    raise ValueError(f'Unsupported score_mode: {args.score_mode}')
 
 def train_dpo(args):
     header, pairs = load_preference_pairs(args.pref_file)
@@ -87,71 +141,64 @@ def train_dpo(args):
         window_start = int(pair['window_start'])
         window_length = int(pair['window_length'])
 
-        chosen_stats = trajectory_logprob(
+        chosen_stats = _compute_preference_stat(
             train_policy,
-            args.task_name,
-            header.get('camera_names', ['top']),
+            args,
+            header,
             stats,
-            chosen_meta['initial_object_pose'],
-            chosen_arrays['actions_env'],
-            chosen_arrays['actions_norm'],
-            device=args.device,
-            temporal_agg=args.temporal_agg,
-            decay_k=args.decay_k,
-            window_start=window_start,
-            window_length=window_length,
+            chosen_meta,
+            chosen_arrays,
+            window_start,
+            window_length,
         )
-        rejected_stats = trajectory_logprob(
+        rejected_stats = _compute_preference_stat(
             train_policy,
-            args.task_name,
-            header.get('camera_names', ['top']),
+            args,
+            header,
             stats,
-            rejected_meta['initial_object_pose'],
-            rejected_arrays['actions_env'],
-            rejected_arrays['actions_norm'],
-            device=args.device,
-            temporal_agg=args.temporal_agg,
-            decay_k=args.decay_k,
-            window_start=window_start,
-            window_length=window_length,
+            rejected_meta,
+            rejected_arrays,
+            window_start,
+            window_length,
         )
         with torch.no_grad():
-            ref_chosen_stats = trajectory_logprob(
+            ref_chosen_stats = _compute_preference_stat(
                 ref_policy,
-                args.task_name,
-                header.get('camera_names', ['top']),
+                args,
+                header,
                 stats,
-                chosen_meta['initial_object_pose'],
-                chosen_arrays['actions_env'],
-                chosen_arrays['actions_norm'],
-                device=args.device,
-                temporal_agg=args.temporal_agg,
-                decay_k=args.decay_k,
-                window_start=window_start,
-                window_length=window_length,
+                chosen_meta,
+                chosen_arrays,
+                window_start,
+                window_length,
             )
-            ref_rejected_stats = trajectory_logprob(
+            ref_rejected_stats = _compute_preference_stat(
                 ref_policy,
-                args.task_name,
-                header.get('camera_names', ['top']),
+                args,
+                header,
                 stats,
-                rejected_meta['initial_object_pose'],
-                rejected_arrays['actions_env'],
-                rejected_arrays['actions_norm'],
-                device=args.device,
-                temporal_agg=args.temporal_agg,
-                decay_k=args.decay_k,
-                window_start=window_start,
-                window_length=window_length,
+                rejected_meta,
+                rejected_arrays,
+                window_start,
+                window_length,
             )
 
+        chosen_log_prob = _select_preference_score(chosen_stats, args.logprob_reduction, args.score_mode)
+        rejected_log_prob = _select_preference_score(rejected_stats, args.logprob_reduction, args.score_mode)
+        ref_chosen_log_prob = _select_preference_score(ref_chosen_stats, args.logprob_reduction, args.score_mode)
+        ref_rejected_log_prob = _select_preference_score(ref_rejected_stats, args.logprob_reduction, args.score_mode)
+
         loss, margin = dpo_loss(
-            chosen_stats['log_prob'],
-            rejected_stats['log_prob'],
-            ref_chosen_stats['log_prob'],
-            ref_rejected_stats['log_prob'],
+            chosen_log_prob,
+            rejected_log_prob,
+            ref_chosen_log_prob,
+            ref_rejected_log_prob,
             args.beta,
         )
+        bc_reg_loss = torch.zeros_like(loss)
+        if args.bc_reg_coef > 0:
+            bc_reg_loss = -chosen_stats['mean_score'].mean() * args.bc_reg_coef
+            loss = loss + bc_reg_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -162,8 +209,17 @@ def train_dpo(args):
             'step': step,
             'loss': float(loss.detach().cpu().item()),
             'margin': float(margin.cpu().item()),
+            'logprob_reduction': args.logprob_reduction,
+            'score_mode': args.score_mode,
             'chosen_log_prob': float(chosen_stats['log_prob'].detach().cpu().item()),
             'rejected_log_prob': float(rejected_stats['log_prob'].detach().cpu().item()),
+            'chosen_mean_log_prob': float(chosen_stats['mean_log_prob'].detach().cpu().item()),
+            'rejected_mean_log_prob': float(rejected_stats['mean_log_prob'].detach().cpu().item()),
+            'chosen_mean_score': float(chosen_stats['mean_score'].detach().cpu().item()),
+            'rejected_mean_score': float(rejected_stats['mean_score'].detach().cpu().item()),
+            'bc_reg_loss': float(bc_reg_loss.detach().cpu().item()),
+            'chosen_token_count': int(chosen_stats['token_count']),
+            'rejected_token_count': int(rejected_stats['token_count']),
         }
         append_jsonl(str(metrics_path), metrics)
         pbar.set_postfix(loss=metrics['loss'], margin=metrics['margin'])
@@ -204,6 +260,11 @@ def parse_args():
     parser.add_argument('--beta', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--grad_clip', type=float, default=1.0)
+    parser.add_argument('--score_mode', choices=['gaussian_replay', 'variational_chunk_elbo'], default='gaussian_replay')
+    parser.add_argument('--posterior_decode_mode', choices=['sample', 'mean'], default='mean')
+    parser.add_argument('--variational_kl_coef', type=float, default=1.0)
+    parser.add_argument('--bc_reg_coef', type=float, default=0.0)
+    parser.add_argument('--logprob_reduction', choices=['sum', 'mean'], default='mean')
     parser.add_argument('--checkpoint_interval', type=int, default=5)
     parser.add_argument('--resume_ckpt', default='auto')
     parser.add_argument('--temporal_agg', action='store_true')

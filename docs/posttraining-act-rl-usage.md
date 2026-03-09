@@ -10,7 +10,7 @@ export MPLCONFIGDIR=/tmp/matplotlib
 ```
 
 ## 1. Collect rollouts from a BC checkpoint
-Example: collect 6 matched seed groups with 3 rollouts each for transfer cube.
+Example: collect 24 matched seed groups with 4 rollouts each for transfer cube. `auto` sampling falls back to mean-centered Gaussian exploration for legacy BC checkpoints whose learned action std was never trained.
 
 ```bash
 python scripts/collect_posttrain_rollouts.py \
@@ -18,11 +18,13 @@ python scripts/collect_posttrain_rollouts.py \
   --source_ckpt /tmp/act_mps_act_train/policy_rollout_best.ckpt \
   --dataset_stats /tmp/act_mps_act_train/dataset_stats.pkl \
   --out_dir /tmp/act_posttrain_transfer_cube_rollouts \
-  --num_seed_groups 6 \
-  --rollouts_per_seed 3 \
+  --num_seed_groups 24 \
+  --rollouts_per_seed 4 \
   --seed_start 3000 \
   --device mps \
-  --temporal_agg
+  --temporal_agg \
+  --sampling_strategy auto \
+  --exploration_std 0.05
 ```
 
 ## 2. Build preferences from rollout artifacts

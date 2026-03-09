@@ -1,0 +1,53 @@
+@startuml
+title Variational DPO Sequence for One Chosen/Rejected Window
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+autonumber
+
+actor Trainer
+participant "Preference Pair\n(chosen/rejected window)" as Pair
+participant "Trajectory Replay" as Replay
+participant "ACT Policy θ" as Policy
+participant "ACT Reference π_ref" as Ref
+participant "Encoder\nq(z|o,a)" as Encoder
+participant "Decoder\np(a|o,z)" as Decoder
+participant "DPO Loss" as Loss
+
+Trainer -> Pair : load chosen/rejected window metadata
+Pair --> Trainer : chosen window W+, rejected window W-
+
+loop for each window in {W+, W-}
+  Trainer -> Replay : replay observations over window timesteps
+  loop for each chunk start t in window
+    Replay --> Trainer : observation o_t, target chunk a_t^(H), pad mask
+    Trainer -> Policy : score_action_chunk(o_t, a_t^(H), mask)
+    Policy -> Encoder : training-time latent inference
+    Encoder --> Policy : mu, logvar
+    Policy -> Decoder : posterior decode (mean or sample)
+    Decoder --> Policy : chunk mean a_hat, action_log_std
+    Policy --> Trainer : chunk score S_theta(o_t, a_t^(H))
+
+    Trainer -> Ref : score_action_chunk(o_t, a_t^(H), mask)
+    Ref -> Encoder : training-time latent inference
+    Encoder --> Ref : mu_ref, logvar_ref
+    Ref -> Decoder : posterior decode
+    Decoder --> Ref : chunk mean, action_log_std
+    Ref --> Trainer : reference chunk score S_ref(o_t, a_t^(H))
+  end
+  Trainer -> Trainer : aggregate chunk scores to window score
+end
+
+Trainer -> Loss : compute variational DPO margin from\nS_theta(W+), S_theta(W-), S_ref(W+), S_ref(W-)
+Loss --> Trainer : scalar loss
+Trainer -> Policy : backprop + optimizer step
+
+note right of Loss
+Default form:
+-log sigma(beta * [
+ (S_theta(W+) - S_theta(W-))
+ -(S_ref(W+) - S_ref(W-))
+])
+end note
+@enduml
