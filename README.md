@@ -1,6 +1,22 @@
 # ACT: Action Chunking with Transformers
 
+## Development History
+This fork has evolved through several major stages:
+
+- **Apple Silicon ACT baseline** — ACT training/evaluation was stabilized on macOS MPS for transfer-cube and insertion. See `docs/reports/EXPERIMENT_REPORT_MPS_ACT.md` and `docs/reports/EXPERIMENT_REPORT_MPS_INSERTION_ACT.md`.
+- **Rollout-best evaluation workflow** — checkpoint selection was extended beyond offline validation loss to closed-loop rollout sweeps. See `README.md` rollout-best workflow notes and `docs/reports/EXPERIMENT_REPORT_MPS_INSERTION_ACT.md`.
+- **Post-training RL / DPO experiments** — a full rollout → preference → DPO / PPO-style pipeline was added, with experiment tracking in `docs/reports/EXPERIMENT_REPORT_ACT_POSTTRAIN_TRANSFER_CUBE.md` and `docs/reports/DPO_PROGRESS_LOG.md`.
+- **Variational DPO redesign** — the project now includes a latent-aware reformulation, engineering spec, development plan, and diagrams for ACT-specific preference optimization. Start with `docs/reports/ACT_DPO_REFORMULATION_MEMO.md`, `docs/specs/ACT_VARIATIONAL_DPO_ENGINEERING_SPEC.md`, and `docs/specs/diagrams/README.md`.
+- **LIBERO Task 0 integration** — one LIBERO-Object task was integrated end-to-end for data loading, BC training, rollout probing, and closed-loop evaluation. Current status: infrastructure works, but BC success is still zero, so LIBERO DPO is blocked by the baseline. See `docs/LIBERO_OBJECT_TASK0_USAGE.md` and `docs/reports/EXPERIMENT_REPORT_LIBERO_OBJECT_TASK0_ACT_VDPO.md`.
+
+Current practical status:
+- transfer-cube: strongest DPO run improved over BC, but robustness is still mixed
+- insertion: stabilized DPO produced a small improvement over BC
+- LIBERO Task 0: integration complete, baseline still underpowered
+
 ## Fork-Specific Information (zebehn/act)
+This fork now also contains an experimental LIBERO-Object Task 0 integration path for ACT + variational DPO. See `docs/LIBERO_OBJECT_TASK0_USAGE.md` and `docs/reports/EXPERIMENT_REPORT_LIBERO_OBJECT_TASK0_ACT_VDPO.md`.
+
 This fork adds Apple Silicon support and experiment documentation on top of the original ACT repository.
 
 - Device support: `--device auto|mps|cuda|cpu` (`auto` prefers MPS on macOS).

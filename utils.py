@@ -4,6 +4,7 @@ import os
 import h5py
 from torch.utils.data import TensorDataset, DataLoader
 from device_utils import dataloader_pin_memory
+from libero_adapter import load_libero_data, resolve_libero_task_config
 
 import IPython
 e = IPython.embed
@@ -111,7 +112,10 @@ def get_norm_stats(dataset_dir, episode_ids):
     return stats
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, device=None, episode_ids=None):
+def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, device=None, episode_ids=None, task_config=None):
+    if task_config is not None and task_config.get('dataset_type') == 'libero_demo_hdf5':
+        print(f"\nData from LIBERO demo file: {task_config['dataset_path']}\n")
+        return load_libero_data(task_config, batch_size_train, batch_size_val, device=device, episode_ids=episode_ids)
     print(f'\nData from: {dataset_dir}\n')
     if episode_ids is None:
         if num_episodes < 1:

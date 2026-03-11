@@ -18,6 +18,8 @@ from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
 from device_utils import resolve_device
+from task_registry import is_libero_task, resolve_task_config, list_task_episode_ids
+from libero_adapter import eval_libero_bc
 
 import IPython
 e = IPython.embed
@@ -73,20 +75,16 @@ def main(args):
     num_epochs = args['num_epochs']
 
     # get task parameters
-    is_sim = task_name[:4] == 'sim_'
-    if is_sim:
-        from constants import SIM_TASK_CONFIGS
-        task_config = SIM_TASK_CONFIGS[task_name]
-    else:
-        from aloha_scripts.constants import TASK_CONFIGS
-        task_config = TASK_CONFIGS[task_name]
+    task_config = resolve_task_config(task_name)
+    is_libero = is_libero_task(task_name)
+    is_sim = task_config.get('task_source') == 'sim'
     dataset_dir = task_config['dataset_dir']
     num_episodes = task_config['num_episodes']
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
-    available_episode_ids = list_available_episode_ids(dataset_dir)
+    available_episode_ids = list_task_episode_ids(task_config)
     if len(available_episode_ids) == 0:
-        raise FileNotFoundError(f'No episode_*.hdf5 files found in dataset directory: {dataset_dir}')
+        raise FileNotFoundError(f'No episodes found for task {task_name} at {dataset_dir}')
     if len(available_episode_ids) < num_episodes:
         print(
             f'Found {len(available_episode_ids)} local episodes in {dataset_dir}; '
@@ -96,7 +94,7 @@ def main(args):
     selected_episode_ids = available_episode_ids[:num_episodes]
 
     # fixed parameters
-    state_dim = 14
+    state_dim = task_config.get('state_dim', 14)
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -137,6 +135,7 @@ def main(args):
         'real_robot': not is_sim,
         'device': device,
         'resume_ckpt': args.get('resume_ckpt'),
+        'task_config': task_config,
     }
 
     if is_eval:
@@ -144,7 +143,10 @@ def main(args):
         save_episode = not args.get('no_save_episode', False)
         results = []
         for ckpt_name in ckpt_names:
-            success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=save_episode)
+            if is_libero:
+                success_rate, avg_return = eval_libero_bc(config, ckpt_name, save_episode=save_episode)
+            else:
+                success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=save_episode)
             results.append([ckpt_name, success_rate, avg_return])
 
         for ckpt_name, success_rate, avg_return in results:
@@ -160,6 +162,7 @@ def main(args):
         batch_size_val,
         device=device,
         episode_ids=selected_episode_ids,
+        task_config=task_config,
     )
 
     # save dataset stats
@@ -281,6 +284,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         ### evaluation loop
         if temporal_agg:
             all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim], device=device)
+            all_time_action_mask = torch.zeros([max_timesteps, max_timesteps+num_queries], dtype=torch.bool, device=device)
 
         qpos_history = torch.zeros((1, max_timesteps, state_dim), device=device)
         image_list = [] # for visualization
@@ -313,8 +317,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         all_actions = policy(qpos, curr_image)
                     if temporal_agg:
                         all_time_actions[[t], t:t+num_queries] = all_actions
+                        all_time_action_mask[[t], t:t+num_queries] = True
                         actions_for_curr_step = all_time_actions[:, t]
-                        actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
+                        actions_populated = all_time_action_mask[:, t]
                         actions_for_curr_step = actions_for_curr_step[actions_populated]
                         k = 0.01
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))

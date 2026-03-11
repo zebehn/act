@@ -310,3 +310,63 @@ Validate the new `variational_chunk_elbo` score mode end-to-end on `sim_insertio
 
 ### Interpretation
 The variational score mode successfully completed end-to-end on insertion and matched the BC success rate, but it did not improve average return and did not outperform the stronger surrogate Gaussian-replay DPO variant. This suggests the variational formulation is viable, but insertion likely needs task-specific tuning (e.g. shorter windows, BC regularization, or deterministic anchor-aware preference filtering).
+
+
+## Experiment 8: LIBERO-Object Task 0 Integration and Pilot
+### Scope
+Implemented one additional dataset/runtime target:
+- `libero_object_task0`
+- suite: `libero_object`
+- task id: `0`
+- task name: `pick_up_the_alphabet_soup_and_place_it_in_the_basket`
+
+### New infrastructure
+- LIBERO task registry and dataset adapter
+- direct LIBERO HDF5 demo loading
+- LIBERO closed-loop evaluation through `imitate_episodes.py`
+- LIBERO-compatible rollout collection path for post-training
+- deterministic anchor candidate support also used for LIBERO rollout probing
+
+### BC pilots
+- 1-epoch smoke checkpoint: `/tmp/libero_object_task0_smoke`
+  - result: **0.0 success**, **0.0 average return**
+- 50-epoch BC pilot: `/tmp/libero_object_task0_bc50`
+  - best offline val loss: **0.486210** at epoch **47**
+  - closed-loop eval: **0.0 success**, **0.0 average return**
+
+### DPO readiness probe
+- rollout root: `/tmp/libero_object_task0_rollout_probe`
+- 4 rollout probe with deterministic anchors + exploration
+- result: **0/4 successes**, **0.0 average return**
+
+### Interpretation
+LIBERO integration is operational end-to-end, but the Task 0 ACT baseline is currently too weak to generate informative rollout preferences. That blocks a meaningful rollout-based variational DPO experiment for this task at the moment.
+
+### Outcome
+- **Implementation status:** complete for the initial single-task LIBERO integration
+- **Experiment status:** BC training and closed-loop evaluation completed; DPO blocked by zero-success baseline / zero-signal rollout probe
+- See `docs/LIBERO_OBJECT_TASK0_USAGE.md` and `docs/reports/EXPERIMENT_REPORT_LIBERO_OBJECT_TASK0_ACT_VDPO.md` for details.
+
+
+## Experiment 9: LIBERO BC Tuning Pass for Nonzero Success
+### Objective
+Attempt to tune the LIBERO-Object Task 0 ACT baseline until it produces nonzero closed-loop rollout success.
+
+### Fixes / changes applied
+- temporal-aggregation occupancy bug fix for padded action dimensions
+- environment reconstruction from LIBERO demo `env_args`
+- selectable LIBERO state source (`joint_gripper` vs `ee_gripper`)
+- optional disablement of action normalization for LIBERO
+- quick eval override via `LIBERO_EVAL_NUM_ROLLOUTS`
+
+### Variants attempted
+- `/tmp/libero_object_task0_bc50` with corrected eval path: **0.0** success
+- `/tmp/libero_object_task0_chunk10_e30`: **0.0** success on 10-rollout eval
+- `/tmp/libero_object_task0_chunk10_e100`: **0.0** success on 10-rollout eval
+- `/tmp/libero_object_task0_rawact_chunk10_e30`: **0.0** success on 10-rollout eval
+
+### Result
+No tuned LIBERO BC variant reached nonzero rollout success in this pass.
+
+### Interpretation
+The current LIBERO integration is functional, but ACT does not yet produce a usable closed-loop Task 0 baseline under the tested adapter and hyperparameter family. This keeps LIBERO rollout-based DPO blocked for now.

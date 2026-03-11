@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from constants import SIM_TASK_CONFIGS
+from task_registry import resolve_task_config
 from device_utils import resolve_device
 from policy import ACTPolicy
 
@@ -24,9 +24,7 @@ DEFAULT_ACT_HPARAMS = {
 
 
 def get_task_config(task_name: str) -> Dict[str, Any]:
-    if task_name not in SIM_TASK_CONFIGS:
-        raise KeyError(f'Unsupported simulator task for post-training: {task_name}')
-    return SIM_TASK_CONFIGS[task_name]
+    return resolve_task_config(task_name)
 
 
 def make_act_policy_config(task_name: str, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

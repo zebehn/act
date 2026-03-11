@@ -18,6 +18,8 @@ from device_utils import resolve_device
 from posttrain.common import build_act_policy, get_task_config, load_policy_checkpoint, save_json
 from posttrain.schema import ROLLOUT_SCHEMA_VERSION, save_rollout_record
 from sim_env import BOX_POSE, make_sim_env
+from libero_adapter import libero_obs_to_image, libero_obs_to_qpos, make_libero_env, select_libero_init_state
+from task_registry import is_libero_task
 
 
 @dataclass
@@ -82,6 +84,63 @@ def set_task_initial_pose(task_name: str, pose: np.ndarray):
         BOX_POSE[0] = np.asarray(pose, dtype=np.float32)
         return
     raise NotImplementedError(f'Unsupported task for rollout reset pose: {task_name}')
+
+
+def _make_task_env(task_name: str, task_config: Dict[str, Any]):
+    if is_libero_task(task_name):
+        env, init_states, _task, _benchmark = make_libero_env(task_config)
+        return env, init_states, 1.0
+    env = make_sim_env(task_name)
+    return env, None, float(env.task.max_reward)
+
+
+def _select_task_initial_state(task_name: str, init_state_pool, seed: int):
+    if is_libero_task(task_name):
+        init_state, init_state_id = select_libero_init_state(init_state_pool, seed)
+        return np.asarray(init_state, dtype=np.float32), {'init_state_id': int(init_state_id)}
+    pose = sample_initial_object_pose(task_name, seed)
+    return np.asarray(pose, dtype=np.float32), {}
+
+
+def _reset_task_env(env, task_name: str, initial_state: np.ndarray):
+    if is_libero_task(task_name):
+        env.reset()
+        return env.set_init_state(initial_state)
+    set_task_initial_pose(task_name, initial_state)
+    return env.reset()
+
+
+def _extract_obs(task_name: str, state_obj):
+    if is_libero_task(task_name):
+        return state_obj
+    return state_obj.observation
+
+
+def _extract_qpos(task_name: str, obs) -> np.ndarray:
+    if is_libero_task(task_name):
+        return libero_obs_to_qpos(obs)
+    return np.asarray(obs['qpos'], dtype=np.float32)
+
+
+def _step_task_env(env, task_name: str, action: np.ndarray, source_action_dim: Optional[int] = None):
+    if is_libero_task(task_name):
+        env_action = np.asarray(action[: source_action_dim or 7], dtype=np.float32)
+        obs, reward, done, _info = env.step(env_action)
+        return obs, float(reward if reward is not None else 0.0), bool(done)
+    ts = env.step(action)
+    reward = float(ts.reward if ts.reward is not None else 0.0)
+    return ts, reward, False
+
+
+def get_image_from_obs(task_name: str, obs, camera_names: Sequence[str], device: torch.device) -> torch.Tensor:
+    if is_libero_task(task_name):
+        return libero_obs_to_image(obs, camera_names, device)
+    curr_images = []
+    for cam_name in camera_names:
+        curr_image = rearrange(obs['images'][cam_name], 'h w c -> c h w')
+        curr_images.append(curr_image)
+    curr_image = np.stack(curr_images, axis=0)
+    return torch.from_numpy(curr_image / 255.0).float().to(device).unsqueeze(0)
 
 
 def get_image_from_ts(ts, camera_names: Sequence[str], device: torch.device) -> torch.Tensor:
@@ -175,20 +234,32 @@ class ChunkDistributionHistory:
 
 
 class TrajectoryReplay:
-    def __init__(self, task_name: str, camera_names: Sequence[str], initial_object_pose: np.ndarray, actions_env: np.ndarray):
+    def __init__(self, task_name: str, camera_names: Sequence[str], initial_object_pose: np.ndarray, actions_env: np.ndarray, task_config: Optional[Dict[str, Any]] = None):
         self.task_name = task_name
         self.camera_names = list(camera_names)
         self.initial_object_pose = np.asarray(initial_object_pose, dtype=np.float32)
         self.actions_env = np.asarray(actions_env, dtype=np.float32)
+        self.task_config = task_config or get_task_config(task_name)
 
     def iter_observations(self):
-        set_task_initial_pose(self.task_name, self.initial_object_pose)
-        env = make_sim_env(self.task_name)
-        ts = env.reset()
-        for action in self.actions_env:
-            obs = ts.observation
-            yield obs
-            ts = env.step(action)
+        env, _init_state_pool, _env_max_reward = _make_task_env(self.task_name, self.task_config)
+        state_obj = _reset_task_env(env, self.task_name, self.initial_object_pose)
+        try:
+            for action in self.actions_env:
+                obs = _extract_obs(self.task_name, state_obj)
+                yield obs
+                state_obj, _reward, done = _step_task_env(
+                    env,
+                    self.task_name,
+                    action,
+                    source_action_dim=self.task_config.get('source_action_dim'),
+                )
+                if done:
+                    break
+        finally:
+            close = getattr(env, 'close', None)
+            if callable(close):
+                close()
 
 
 @torch.no_grad()
@@ -250,28 +321,27 @@ def collect_rollouts(
         },
     )
 
-    env = make_sim_env(task_name)
-    env_max_reward = env.task.max_reward
+    env, init_state_pool, env_max_reward = _make_task_env(task_name, task_config)
     num_queries = policy.model.num_queries
 
     for seed_offset in range(num_seed_groups):
         seed = seed_start + seed_offset
-        initial_pose = sample_initial_object_pose(task_name, seed)
+        initial_pose, init_state_meta = _select_task_initial_state(task_name, init_state_pool, seed)
         for candidate_index in range(rollouts_per_seed):
             rollout_id = f'seed{seed:04d}-cand{candidate_index:02d}'
             candidate_force_deterministic = candidate_index < deterministic_candidates
-            set_task_initial_pose(task_name, initial_pose)
-            ts = env.reset()
+            state_obj = _reset_task_env(env, task_name, initial_pose)
             history = ChunkDistributionHistory(num_queries=num_queries, temporal_agg=temporal_agg, decay_k=decay_k, detach_history=True)
             actions_norm = []
             actions_env = []
             rewards = []
             qpos_seq = []
             for t in range(episode_len):
-                qpos_raw = np.asarray(ts.observation['qpos'], dtype=np.float32)
+                obs = _extract_obs(task_name, state_obj)
+                qpos_raw = _extract_qpos(task_name, obs)
                 qpos_seq.append(qpos_raw)
                 qpos = torch.from_numpy(stats.normalize_qpos(qpos_raw)).float().to(device_obj).unsqueeze(0)
-                image = get_image_from_ts(ts, camera_names, device_obj)
+                image = get_image_from_obs(task_name, obs, camera_names, device_obj)
                 dist, value = history.step_distribution(policy, qpos, image, t)
                 raw_action = _sample_rollout_action(
                     dist,
@@ -281,17 +351,19 @@ def collect_rollouts(
                 )
                 raw_action_np = raw_action.squeeze(0).detach().cpu().numpy().astype(np.float32)
                 env_action = stats.denormalize_action(raw_action_np).astype(np.float32)
-                ts = env.step(env_action)
+                state_obj, reward, done = _step_task_env(env, task_name, env_action, source_action_dim=task_config.get('source_action_dim'))
                 actions_norm.append(raw_action_np)
                 actions_env.append(env_action)
-                rewards.append(float(ts.reward if ts.reward is not None else 0.0))
+                rewards.append(reward)
+                if done:
+                    break
             rewards_np = np.asarray(rewards, dtype=np.float32)
             actions_norm_np = np.asarray(actions_norm, dtype=np.float32)
             actions_env_np = np.asarray(actions_env, dtype=np.float32)
             qpos_seq_np = np.asarray(qpos_seq, dtype=np.float32)
             highest_reward = float(np.max(rewards_np)) if len(rewards_np) else 0.0
             episode_return = float(np.sum(rewards_np))
-            success = bool(highest_reward == env_max_reward)
+            success = bool(highest_reward >= env_max_reward)
             metadata = {
                 'schema_version': ROLLOUT_SCHEMA_VERSION,
                 'rollout_id': rollout_id,
@@ -306,11 +378,13 @@ def collect_rollouts(
                 'exploration_std': float(exploration_std),
                 'force_deterministic': bool(candidate_force_deterministic),
                 'initial_object_pose': initial_pose.tolist(),
+                'initial_state_kind': 'libero_init_state' if is_libero_task(task_name) else 'sim_object_pose',
                 'num_steps': int(len(actions_env_np)),
                 'episode_return': episode_return,
                 'highest_reward': highest_reward,
                 'success': success,
                 'env_max_reward': float(env_max_reward),
+                **init_state_meta,
             }
             arrays = {
                 'actions_norm': actions_norm_np,
@@ -353,7 +427,7 @@ def trajectory_chunk_score(
     kl_coef: float = 1.0,
 ):
     device_obj = resolve_device(device)
-    replay = TrajectoryReplay(task_name, camera_names, initial_object_pose, actions_env)
+    replay = TrajectoryReplay(task_name, camera_names, initial_object_pose, actions_env, task_config=get_task_config(task_name))
     total_score = None
     total_log_prob = None
     total_entropy = None
@@ -366,9 +440,9 @@ def trajectory_chunk_score(
             break
         if t < window_start:
             continue
-        qpos_raw = np.asarray(obs['qpos'], dtype=np.float32)
+        qpos_raw = _extract_qpos(task_name, obs)
         qpos = torch.from_numpy(stats.normalize_qpos(qpos_raw)).float().to(device_obj).unsqueeze(0)
-        image = get_image_from_ts(type('TS', (), {'observation': obs}), camera_names, device_obj)
+        image = get_image_from_obs(task_name, obs, camera_names, device_obj)
         chunk_actions, chunk_is_pad = _build_action_chunk(actions_norm, t, policy.model.num_queries, device_obj)
         chunk_stats = policy.score_action_chunk(
             qpos,
@@ -420,7 +494,7 @@ def trajectory_logprob(
     window_length: Optional[int] = None,
 ):
     device_obj = resolve_device(device)
-    replay = TrajectoryReplay(task_name, camera_names, initial_object_pose, actions_env)
+    replay = TrajectoryReplay(task_name, camera_names, initial_object_pose, actions_env, task_config=get_task_config(task_name))
     history = ChunkDistributionHistory(
         num_queries=policy.model.num_queries,
         temporal_agg=temporal_agg,
@@ -433,9 +507,9 @@ def trajectory_logprob(
     value_samples = []
     token_count = 0
     for t, obs in enumerate(replay.iter_observations()):
-        qpos_raw = np.asarray(obs['qpos'], dtype=np.float32)
+        qpos_raw = _extract_qpos(task_name, obs)
         qpos = torch.from_numpy(stats.normalize_qpos(qpos_raw)).float().to(device_obj).unsqueeze(0)
-        image = get_image_from_ts(type('TS', (), {'observation': obs}), camera_names, device_obj)
+        image = get_image_from_obs(task_name, obs, camera_names, device_obj)
         dist, value = history.step_distribution(policy, qpos, image, t)
         if window_start <= t < end:
             action = torch.from_numpy(actions_norm[t]).float().to(device_obj).unsqueeze(0)
